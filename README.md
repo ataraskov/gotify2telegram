@@ -28,6 +28,21 @@ This Gotify plugin forwards all received messages to Telegram through the Telegr
 
     3. Follow instructions from step 2 in the shared object installation.
 
+## Message formatting
+
+Messages are forwarded to Telegram verbatim by default, so links and
+`@usernames` keep their underscores. Telegram's legacy Markdown treats `_` as an
+italic marker with no word-boundary rule, so a message containing both
+`t.me/some_chat` and `@some_user` would otherwise have the whole span between
+them italicised and both underscores dropped.
+
+A message is only sent with `parse_mode=Markdown` when Gotify marks it as
+Markdown, i.e. when it carries:
+
+```json
+"extras": { "client::display": { "contentType": "text/markdown" } }
+```
+
 ## Troubleshooting
 1. When only the Gotify dashboard receives your message, but not Telegram:
 

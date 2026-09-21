@@ -3,3 +3,4 @@ vendor
 build
 *.so
 .env
+/plugin-template

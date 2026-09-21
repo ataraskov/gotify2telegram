@@ -26,6 +26,15 @@ const iconMaxSize = 128
 // telegramCaptionLimit is Telegram's max length for a sendPhoto caption.
 const telegramCaptionLimit = 1024
 
+// telegramMessageLimit is how much text goes into a single sendMessage. Telegram
+// counts 4096 UTF-16 units; counting runes instead leaves room for the surrogate
+// pairs emoji take up.
+const telegramMessageLimit = 4000
+
+// markdownContentType is the Gotify content type whose messages are written as
+// Markdown. Anything else is forwarded verbatim.
+const markdownContentType = "text/markdown"
+
 // GetGotifyPluginInfo returns gotify plugin info
 func GetGotifyPluginInfo() plugin.Info {
     return plugin.Info{
@@ -56,6 +65,50 @@ type GotifyMessage struct {
     Message string;
     Title string;
     Priority uint32;
+    Extras GotifyExtras `json:"extras"`;
+}
+
+// GotifyExtras carries the parts of a message's "extras" this plugin reads.
+type GotifyExtras struct {
+    ClientDisplay struct {
+        ContentType string `json:"contentType"`
+    } `json:"client::display"`
+}
+
+// parse_mode returns the Telegram parse mode for a message. Only a message
+// Gotify itself marks as Markdown is parsed as Markdown; everything else is
+// sent verbatim, so underscores in URLs and @usernames are not swallowed as
+// italics (Telegram's legacy Markdown has no word-boundary rule, so a message
+// containing t.me/some_chat and @some_user parses the whole span between them
+// as italic and drops both underscores).
+func (m *GotifyMessage) parse_mode() string {
+    if strings.EqualFold(strings.TrimSpace(m.Extras.ClientDisplay.ContentType), markdownContentType) {
+        return "Markdown"
+    }
+    return ""
+}
+
+// split_message cuts s into chunks of at most limit runes. Slicing by byte
+// would cut multi-byte characters in half — a Cyrillic message sliced that way
+// is invalid UTF-8, which Telegram rejects.
+func split_message(s string, limit int) []string {
+    if s == "" {
+        return nil
+    }
+    runes := []rune(s)
+    if limit <= 0 || len(runes) <= limit {
+        return []string{s}
+    }
+
+    chunks := make([]string, 0, (len(runes)+limit-1)/limit)
+    for i := 0; i < len(runes); i += limit {
+        end := i + limit
+        if end > len(runes) {
+            end = len(runes)
+        }
+        chunks = append(chunks, string(runes[i:end]))
+    }
+    return chunks
 }
 
 type Application struct {
@@ -120,21 +173,12 @@ func (p *Plugin) post_to_telegram(method string, data interface{}) (*http.Respon
     return resp, bodyBytes, nil
 }
 
-func (p *Plugin) send_msg_to_telegram(msg string) {
-    step_size := 4090
-    sending_message := ""
-
-    for i := 0; i < len(msg); i += step_size {
-        if i+step_size < len(msg) {
-            sending_message = msg[i : i+step_size]
-        } else {
-            sending_message = msg[i:len(msg)]
-        }
-
+func (p *Plugin) send_msg_to_telegram(msg string, parseMode string) {
+    for _, sending_message := range split_message(msg, telegramMessageLimit) {
         data := Payload{
             ChatID:    p.chatid,
             Text:      sending_message,
-            ParseMode: "Markdown",
+            ParseMode: parseMode,
         }
         resp, _, err := p.post_to_telegram("sendMessage", data)
         if err != nil {
@@ -147,7 +191,7 @@ func (p *Plugin) send_msg_to_telegram(msg string) {
             continue
         }
 
-        if resp.StatusCode == http.StatusBadRequest {
+        if resp.StatusCode == http.StatusBadRequest && parseMode != "" {
             // The message may contain text that isn't valid Markdown; fall back to plain text
             // so the notification still arrives instead of being dropped.
             p.debugLogger.Println("Retrying as plain text after Markdown parse failure")
@@ -202,7 +246,7 @@ func downscale_icon(src image.Image) image.Image {
 // caption, so both arrive as a single Telegram message. Returns true once the
 // photo itself was delivered (regardless of whether the caption needed a plain-text
 // retry), so the caller knows not to send the caption text again separately.
-func (p *Plugin) send_photo_to_telegram(photoURL string, caption string) bool {
+func (p *Plugin) send_photo_to_telegram(photoURL string, caption string, parseMode string) bool {
     if photoURL == "" {
         p.debugLogger.Println("send_photo_to_telegram: no app image URL resolved, skipping")
         return false
@@ -234,7 +278,6 @@ func (p *Plugin) send_photo_to_telegram(photoURL string, caption string) bool {
         }
     }
 
-    parseMode := "Markdown"
     for attempt := 0; attempt < 2; attempt++ {
         var buf bytes.Buffer
         writer := multipart.NewWriter(&buf)
@@ -347,32 +390,38 @@ func (p *Plugin) get_app_image_url(appid uint32) string {
     return imageURL
 }
 
+// split_caption splits text into the part that rides along as the photo caption
+// and whatever is left over, counting runes so a multi-byte character is never
+// cut in half.
+func split_caption(text string) (string, string) {
+    runes := []rune(text)
+    if len(runes) <= telegramCaptionLimit {
+        return text, ""
+    }
+    return string(runes[:telegramCaptionLimit]), string(runes[telegramCaptionLimit:])
+}
+
 // forward_to_telegram sends the app icon and text as a single Telegram message
 // (icon with text as its caption) when the text fits Telegram's caption limit.
 // Longer text is split: the first chunk rides as the caption, the rest follows
 // as normal chunked messages. If there's no icon, or sending the photo fails,
 // it falls back to plain chunked text messages.
-func (p *Plugin) forward_to_telegram(appid uint32, text string) {
+func (p *Plugin) forward_to_telegram(appid uint32, text string, parseMode string) {
     photoURL := p.get_app_image_url(appid)
     if photoURL == "" {
-        p.send_msg_to_telegram(text)
+        p.send_msg_to_telegram(text, parseMode)
         return
     }
 
-    caption := text
-    remaining := ""
-    if len(text) > telegramCaptionLimit {
-        caption = text[:telegramCaptionLimit]
-        remaining = text[telegramCaptionLimit:]
-    }
+    caption, remaining := split_caption(text)
 
-    if !p.send_photo_to_telegram(photoURL, caption) {
-        p.send_msg_to_telegram(text)
+    if !p.send_photo_to_telegram(photoURL, caption, parseMode) {
+        p.send_msg_to_telegram(text, parseMode)
         return
     }
 
     if remaining != "" {
-        p.send_msg_to_telegram(remaining)
+        p.send_msg_to_telegram(remaining, parseMode)
     }
 }
 
@@ -413,7 +462,7 @@ func (p *Plugin) get_websocket_msg(url string, token string) {
             p.connect_websocket()
             continue
         }
-        p.forward_to_telegram(msg.Appid, msg.Title+"\n\n"+msg.Message)
+        p.forward_to_telegram(msg.Appid, msg.Title+"\n\n"+msg.Message, msg.parse_mode())
     }
 }
 
